@@ -1,16 +1,20 @@
-// App.js
-import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
-import AudioChatRoom from "./ui/AudioChatRoom";
+import React, { useState } from "react";
+import Login from "./ui/Login";
+import VideoChatRoom from "./ui/VideoChatRoom";
 
-export default function App() {
+function App() {
+  const [username, setUsername] = useState("");
+  const [roomId, setRoomId] = useState("room1"); // 기본 룸
+
   return (
-    <Router>
-      <Routes>
-        <Route
-          path="/AudioChatRoom"
-          element={<AudioChatRoom roomId="room1" userId="user123" />}
-        />
-      </Routes>
-    </Router>
+    <div>
+      {!username ? (
+        <Login onLogin={setUsername} />
+      ) : (
+        <VideoChatRoom roomId={roomId} username={username} />
+      )}
+    </div>
   );
 }
+
+export default App;

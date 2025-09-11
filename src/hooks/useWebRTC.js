@@ -1,110 +1,122 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import mqtt from "mqtt";
 
-/**
- * useWebRTC 훅
- * - roomId: 방 고유 ID
- * - userId: 사용자 고유 ID
- * - turnConfig: TURN 서버 정보 { urls, username, credential }
- */
-export const useWebRTC = (roomId, userId, turnConfig) => {
-  const [remoteStreams, setRemoteStreams] = useState([]);
-  const localAudioRef = useRef(null);
-  const pcRef = useRef(null);
-  const clientRef = useRef(null);
-
-  // 방 입장 시 offer 생성
-  const createOffer = useCallback(async () => {
-    const pc = pcRef.current;
-    if (!pc) return;
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    clientRef.current.publish(
-      `${roomId}/signal`,
-      JSON.stringify({ type: "offer", from: userId, sdp: offer })
-    );
-  }, [roomId, userId]);
+// WebRTC 커스텀 훅 (MQTT 시그널링 + TURN 서버)
+export const useWebRTC = (roomId, username) => {
+  const [peers, setPeers] = useState({});           // 다른 참여자 정보
+  const localStream = useRef();                     // 내 카메라/마이크 스트림
+  const peersRef = useRef({});                      // socketId -> RTCPeerConnection
+  const clientRef = useRef();                       // MQTT 클라이언트
 
   useEffect(() => {
-    // MQTT 연결
-    const client = mqtt.connect("ws://localhost:9001");
-    clientRef.current = client;
+    // 1. MQTT 브로커 연결
+    clientRef.current = mqtt.connect("ws://localhost:9001");
 
-    // RTCPeerConnection 생성
+    clientRef.current.on("connect", () => {
+      console.log("MQTT connected");
+      clientRef.current.subscribe(`${roomId}/#`);
+    });
+
+    // 2. 로컬 카메라/마이크 접근
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      .then(stream => {
+        localStream.current = stream;
+
+        // 3. 룸 참가 메시지 발송
+        clientRef.current.publish(`${roomId}/join`, JSON.stringify({ username }));
+      })
+      .catch(err => console.error("Media error:", err));
+
+    // 4. MQTT 메시지 처리
+    clientRef.current.on("message", async (topic, message) => {
+      const msg = JSON.parse(message.toString());
+      const [_, action, target] = topic.split("/"); // roomId/action/targetUsername
+
+      if (action === "offer" && target === username) {
+        handleReceiveOffer(msg);
+      } else if (action === "answer" && target === username) {
+        handleReceiveAnswer(msg);
+      } else if (action === "ice-candidate" && target === username) {
+        handleNewICECandidate(msg);
+      } else if (action === "join" && msg.username !== username) {
+        // 새 참여자가 들어오면 offer 생성
+        const pc = createPeer(msg.username);
+        peersRef.current[msg.username] = pc;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        clientRef.current.publish(
+          `${roomId}/offer/${msg.username}`,
+          JSON.stringify({ sdp: offer, from: username })
+        );
+        setPeers(prev => ({ ...prev, [msg.username]: { pc, stream: null } }));
+      }
+    });
+
+    return () => {
+      clientRef.current.end();
+      Object.values(peersRef.current).forEach(pc => pc.close());
+    };
+  }, [roomId, username]);
+
+  // RTCPeerConnection 생성
+  const createPeer = (targetUsername) => {
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        turnConfig
+        {
+          urls: "turn:localhost:3478",
+          username: "turnuser",        // turnserver.conf 설정
+          credential: "turnpassword"
+        }
       ]
     });
-    pcRef.current = pc;
 
-    // 로컬 오디오 가져오기 (오디오 전용)
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(stream => {
-        if (localAudioRef.current) {
-          localAudioRef.current.srcObject = stream;
-        }
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-      })
-      .catch(err => {
-        if (err.name === "NotFoundError") {
-          alert("마이크 장치를 찾을 수 없습니다. 연결 후 다시 시도해주세요.");
-        } else {
-          console.error("Audio error: ", err);
-        }
-      });
+    // 내 스트림 트랙 추가
+    localStream.current?.getTracks().forEach(track => pc.addTrack(track, localStream.current));
 
-    // 원격 오디오 스트림 수신
-    pc.ontrack = (event) => {
-      setRemoteStreams(prev => [...prev, event.streams[0]]);
-    };
-
-    // ICE candidate 발생 시 MQTT 전송
+    // ICE candidate 이벤트 발생 시 MQTT로 전달
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        client.publish(`${roomId}/signal`, JSON.stringify({
-          type: "candidate",
-          from: userId,
-          candidate: event.candidate
-        }));
+        clientRef.current.publish(
+          `${roomId}/ice-candidate/${targetUsername}`,
+          JSON.stringify({ candidate: event.candidate, from: username })
+        );
       }
     };
 
-    // MQTT 메시지 수신 처리
-    client.subscribe(`${roomId}/signal`);
-    client.on("message", async (topic, message) => {
-      const data = JSON.parse(message.toString());
-      if (data.from === userId) return;
-
-      try {
-        if (data.type === "offer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          client.publish(`${roomId}/signal`, JSON.stringify({
-            type: "answer",
-            from: userId,
-            sdp: answer
-          }));
-        } else if (data.type === "answer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        } else if (data.type === "candidate") {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-        }
-      } catch (err) {
-        console.error("WebRTC signaling error:", err);
-      }
-    });
-
-    // 클린업
-    return () => {
-      client.end();
-      pc.close();
+    // 원격 스트림 수신 시 peers 상태 업데이트
+    pc.ontrack = (event) => {
+      setPeers(prev => ({
+        ...prev,
+        [targetUsername]: { ...prev[targetUsername], stream: event.streams[0] }
+      }));
     };
-  }, [roomId, userId, turnConfig]);
 
-  return { localAudioRef, remoteStreams, createOffer };
+    return pc;
+  };
+
+  const handleReceiveOffer = async ({ sdp, from }) => {
+    const pc = createPeer(from);
+    peersRef.current[from] = pc;
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    clientRef.current.publish(
+      `${roomId}/answer/${from}`,
+      JSON.stringify({ sdp: answer, from: username })
+    );
+    setPeers(prev => ({ ...prev, [from]: { pc, stream: null } }));
+  };
+
+  const handleReceiveAnswer = async ({ sdp, from }) => {
+    const pc = peersRef.current[from];
+    if (pc) await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  };
+
+  const handleNewICECandidate = async ({ candidate, from }) => {
+    const pc = peersRef.current[from];
+    if (pc) await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  };
+
+  return { localStream, peers };
 };
