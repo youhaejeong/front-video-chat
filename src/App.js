@@ -1,19 +1,19 @@
+// App.jsx
 import React, { useState } from "react";
-import Login from "./ui/Login";
-import VideoChatRoom from "./ui/VideoChatRoom";
+import Login from "../src/ui/Login";
+import VideoChatRoom from "../src/ui/VideoChatRoom";
 
 function App() {
-  const [username, setUsername] = useState("");
-  const [roomId, setRoomId] = useState("room1"); // 기본 룸
+  const [loggedIn, setLoggedIn] = useState(false);
 
   return (
-    <div>
-      {!username ? (
-        <Login onLogin={setUsername} />
+    <>
+      {loggedIn ? (
+        <VideoChatRoom />
       ) : (
-        <VideoChatRoom roomId={roomId} username={username} />
+        <Login onLogin={() => setLoggedIn(true)} />
       )}
-    </div>
+    </>
   );
 }
 
