@@ -2,20 +2,43 @@ import { useState, useEffect, useRef } from "react";
 import mqtt from "mqtt";
 
 export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
-  const [role] = useState(localStorage.getItem("role")); // ROLE_BROADCASTER / ROLE_VIEWER
-  const [localReady, setLocalReady] = useState(false);
-  const localStream = useRef(null); // MediaStream: 카메라/마이크 스트림 저장
-  const mqttClient = useRef(null); // Signaling Server 역할: MQTT 브로커 사용
-  const peerConnections = useRef({}); // RTCPeerConnection 객체 저장
-  const pendingCandidates = useRef({}); // ICE Candidate 임시 저장
-  const pendingAnswers = useRef({}); // Session Description(ANSWER) 임시 저장
-  const pendingStreams = useRef({}); // ontrack 이벤트 전 MediaStream 임시 저장
-  const [peers, setPeers] = useState({}); // 연결된 Peer와 스트림 정보 저장
+  // 사용자의 역할: ROLE_BROADCASTER / ROLE_VIEWER
+  const [role, setRole] = useState(localStorage.getItem("role"));
 
+  useEffect(() => {
+    setRole(localStorage.getItem("role")); // 방 생성/입장 후 role 상태 갱신
+  }, [roomId]);
+
+  // 로컬 미디어 스트림 준비 여부
+  const [localReady, setLocalReady] = useState(false);
+
+  // 로컬 카메라/마이크 스트림 저장
+  const localStream = useRef(null);
+
+  // MQTT 브로커 클라이언트 저장 (Signaling 용)
+  const mqttClient = useRef(null);
+
+  // RTCPeerConnection 객체 저장 (peerName 기준)
+  const peerConnections = useRef({});
+
+  // ICE Candidate 임시 저장 (상대방 RemoteDescription 전에 수신된 후보)
+  const pendingCandidates = useRef({});
+
+  // ANSWER 임시 저장 (상대방 Offer에 대한 응답 전에 수신된 경우)
+  const pendingAnswers = useRef({});
+
+  // ontrack 이벤트 전 MediaStream 임시 저장
+  const pendingStreams = useRef({});
+
+  // 연결된 peer와 스트림 정보 저장
+  const [peers, setPeers] = useState({});
+
+  // 전역에서 pendingStreams 확인 가능하게 설정 (디버깅용)
   window.pendingStreams = pendingStreams;
 
+  // ICE 서버 설정 (STUN/TURN)
   const iceServers = [
-    { urls: "stun:127.0.0.1:3478" }, // STUN 서버: NAT Traversal 지원
+    { urls: "stun:127.0.0.1:3478" }, // NAT traversal 지원
     {
       urls: [
         "turn:127.0.0.1:3478?transport=udp",
@@ -23,13 +46,14 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
       ],
       username: "user",
       credential: "pass",
-    }, // TURN 서버: NAT Traversal + Relay 지원
+    },
   ];
 
-  // MQTT 연결 (Signaling Server 역할)
+  // MQTT 연결 및 signaling 처리
   useEffect(() => {
     if (!roomId || !role) return;
 
+    // 기존 연결 종료
     if (mqttClient.current) {
       mqttClient.current.end(true);
       mqttClient.current = null;
@@ -38,23 +62,25 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
     const username = localStorage.getItem("username");
     mqttClient.current = mqtt.connect("ws://localhost:9001", {
       clientId: username + "_" + Date.now(),
-      reconnectPeriod: 1000,
+      reconnectPeriod: 1000, // 연결 끊기면 1초 후 재연결
     });
 
     const client = mqttClient.current;
-    const joinQueue = [];
+    const joinQueue = []; // localStream 준비 전 viewer join 대기 큐
 
+    // MQTT 연결 완료 시
     client.on("connect", async () => {
       console.log("MQTT connected as", role, "username:", username);
 
       const topics = [
-        `${roomId}/join`,      // Signaling: Peer Join 알림
-        `${roomId}/leave`,     // Signaling: Peer Leave 알림
-        `${roomId}/offer`,     // Signaling: Session Description(OFFER)
-        `${roomId}/answer`,    // Signaling: Session Description(ANSWER)
-        `${roomId}/candidate`, // Signaling: ICE Candidate 교환
+        `${roomId}/join`, // Viewer join 알림
+        `${roomId}/leave`, // Peer leave 알림
+        `${roomId}/offer`, // OFFER 수신
+        `${roomId}/answer`, // ANSWER 수신
+        `${roomId}/candidate`, // ICE candidate 수신
       ];
 
+      // 모든 topic 구독
       let subscribeCount = 0;
       topics.forEach((topic) => {
         client.subscribe(topic, (err) => {
@@ -63,22 +89,24 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
             subscribeCount++;
             if (subscribeCount === topics.length) {
               console.log("모든 subscribe 완료");
+              // Viewer는 join 이벤트 발송
               if (role === "ROLE_VIEWER") {
-                client.publish(`${roomId}/join`, username); // Signaling: Viewer Join 전송
+                client.publish(`${roomId}/join`, username);
               }
             }
           }
         });
       });
 
+      // Broadcaster는 로컬 스트림 준비 후 대기 큐 처리
       if (role === "ROLE_BROADCASTER") {
         await initLocalStream(); // MediaStream 준비
-        joinQueue.forEach((viewer) => sendOffer(viewer)); // Session Description(OFFER) 전송
+        joinQueue.forEach((viewer) => sendOffer(viewer)); // Offer 전송
         joinQueue.length = 0;
       }
     });
 
-    // MQTT 메시지 처리 (Signaling 역할)
+    // MQTT 메시지 처리 (Signaling)
     client.on("message", async (topic, message) => {
       const msg = message.toString();
       const username = localStorage.getItem("username");
@@ -88,18 +116,18 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
         const viewer = msg;
         if (viewer === username) return;
 
-        if (!localReady) joinQueue.push(viewer);
-        else sendOffer(viewer); // Session Description(OFFER) 전송
+        if (!localReady) joinQueue.push(viewer); // 스트림 준비 전 대기
+        else sendOffer(viewer); // Offer 전송
       }
 
       // Viewer leave
       if (topic === `${roomId}/leave`) {
         const leaver = msg;
         if (peers[leaver]) {
-          peerConnections.current[leaver]?.pc.close(); // RTCPeerConnection 종료
+          peerConnections.current[leaver]?.pc.close();
           delete peerConnections.current[leaver];
-          delete pendingCandidates.current[leaver]; // ICE Candidate 정리
-          delete pendingAnswers.current[leaver];    // Session Description 정리
+          delete pendingCandidates.current[leaver];
+          delete pendingAnswers.current[leaver];
           setPeers((prev) => {
             const updated = { ...prev };
             delete updated[leaver];
@@ -112,19 +140,22 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
       if (topic === `${roomId}/offer` && role === "ROLE_VIEWER") {
         const offer = JSON.parse(msg);
         if (offer.target !== username) return;
-        const pc = createPeerConnection(offer.sender); // RTCPeerConnection 생성
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(offer.sdp)); // Session Description(OFFER) 적용
 
-          // RemoteDescription 세팅 후 → ICE Candidate 처리
+        const pc = createPeerConnection(offer.sender);
+        try {
+          // RemoteDescription 세팅
+          await pc.setRemoteDescription(new RTCSessionDescription(offer.sdp));
+
+          // pending candidate 적용
           if (pendingCandidates.current[offer.sender]?.length) {
             for (const c of pendingCandidates.current[offer.sender]) {
-              await pc.addIceCandidate(c); // ICE Candidate 추가
+              await pc.addIceCandidate(c);
             }
             pendingCandidates.current[offer.sender] = [];
           }
 
-          const answer = await pc.createAnswer(); // Session Description(ANSWER) 생성
+          // ANSWER 생성 후 MQTT 전송
+          const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
 
           client.publish(
@@ -132,10 +163,9 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
             JSON.stringify({
               sender: username,
               target: offer.sender,
-              sdp: answer, // Session Description(ANSWER) 전송
+              sdp: answer,
             })
           );
-
         } catch (err) {
           console.error("VIEWER: OFFER 처리 실패", err);
         }
@@ -146,16 +176,16 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
         const answer = JSON.parse(msg);
         const pc = peerConnections.current[answer.sender]?.pc;
         if (!pc) {
-          pendingAnswers.current[answer.sender] = answer.sdp; // Session Description 임시 저장
+          pendingAnswers.current[answer.sender] = answer.sdp;
           return;
         }
 
         try {
-          await pc.setRemoteDescription(new RTCSessionDescription(answer.sdp)); // Session Description(ANSWER) 적용
+          await pc.setRemoteDescription(new RTCSessionDescription(answer.sdp));
 
           if (pendingCandidates.current[answer.sender]?.length) {
             for (const c of pendingCandidates.current[answer.sender]) {
-              await pc.addIceCandidate(c); // ICE Candidate 추가
+              await pc.addIceCandidate(c);
             }
             pendingCandidates.current[answer.sender] = [];
           }
@@ -167,24 +197,24 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
       // ICE Candidate 처리
       if (topic === `${roomId}/candidate`) {
         const candidateMsg = JSON.parse(msg);
-        if (candidateMsg.target !== username) return; // 본인 영상만 처리
         const pc = peerConnections.current[candidateMsg.sender]?.pc;
         if (!candidateMsg.candidate) return;
 
-        const rtcCandidate = new RTCIceCandidate(candidateMsg.candidate); // ICE Candidate 생성
+        const rtcCandidate = new RTCIceCandidate(candidateMsg.candidate);
         if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-          await pc.addIceCandidate(rtcCandidate); // RTCPeerConnection에 Candidate 추가
+          await pc.addIceCandidate(rtcCandidate);
         } else {
           if (!pendingCandidates.current[candidateMsg.sender])
             pendingCandidates.current[candidateMsg.sender] = [];
-          pendingCandidates.current[candidateMsg.sender].push(rtcCandidate); // ICE Candidate 임시 저장
+          pendingCandidates.current[candidateMsg.sender].push(rtcCandidate);
         }
       }
     });
 
+    // 컴포넌트 언마운트 시 정리
     return () => {
-      if (role === "ROLE_VIEWER") client.publish(`${roomId}/leave`, username); // Signaling: Viewer Leave 전송
-      client.end(true); // MQTT 연결 종료
+      if (role === "ROLE_VIEWER") client.publish(`${roomId}/leave`, username);
+      client.end(true);
     };
   }, [roomId, role, localReady]);
 
@@ -193,7 +223,7 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
     try {
       localStream.current = await navigator.mediaDevices.getUserMedia({
         video: true,
-        audio: false, // MediaStream: Video 전송
+        audio: false,
       });
       setLocalReady(true);
     } catch (err) {
@@ -204,8 +234,10 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
   // 로컬 비디오 연결
   useEffect(() => {
     if (localReady && localVideoRef.current && localStream.current) {
-      localVideoRef.current.srcObject = localStream.current; // MediaStream 연결
-      localVideoRef.current.play().catch((err) => console.error("play() 실패:", err));
+      localVideoRef.current.srcObject = localStream.current;
+      localVideoRef.current
+        .play()
+        .catch((err) => console.error("play() 실패:", err));
     }
   }, [localReady, localVideoRef]);
 
@@ -214,42 +246,42 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
     if (peerConnections.current[peerName])
       return peerConnections.current[peerName].pc;
 
-    const pc = new RTCPeerConnection({ iceServers }); // RTCPeerConnection 생성
+    const pc = new RTCPeerConnection({ iceServers });
     pendingCandidates.current[peerName] = [];
 
+    // Broadcaster는 로컬 트랙 추가
     if (role === "ROLE_BROADCASTER" && localStream.current) {
       localStream.current.getTracks().forEach((track) => {
         if (track.kind === "video") {
-          pc.addTrack(track.clone(), localStream.current); // MediaStream Track 복제 추가
+          pc.addTrack(track, localStream.current);
         }
       });
     }
 
-    // ontrack → Viewer 화면 연결
+    // Viewer 화면 연결
     pc.ontrack = (event) => {
       const stream = event.streams[0];
       if (!stream) return;
 
-      setPeers((prev) => ({ ...prev, [peerName]: { pc, stream } })); // Peer 저장
+      setPeers((prev) => ({ ...prev, [peerName]: { pc, stream } }));
 
       const videoEl = peerVideoRefs?.current?.[peerName];
       if (videoEl) {
-        videoEl.srcObject = stream; // MediaStream 연결
+        videoEl.srcObject = stream;
         videoEl.play().catch(console.error);
       } else {
-        pendingStreams.current[peerName] = stream; // ontrack 전 임시 저장
+        pendingStreams.current[peerName] = stream;
       }
     };
 
-    // onicecandidate → MQTT 전송 (Signaling)
+    // ICE Candidate 발생 시 MQTT로 전송
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         mqttClient.current.publish(
           `${roomId}/candidate`,
           JSON.stringify({
             sender: localStorage.getItem("username"),
-            target: peerName, // viewer가 여러명 생길수있게 추가
-            candidate: event.candidate, // ICE Candidate 전송
+            candidate: event.candidate,
           })
         );
       }
@@ -260,38 +292,38 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
     pc.oniceconnectionstatechange = () =>
       console.log("ICEConnectionState:", peerName, pc.iceConnectionState);
 
-    peerConnections.current[peerName] = { pc }; // PeerConnection 저장
+    peerConnections.current[peerName] = { pc };
 
-    // OFFER 생성 직후 pendingAnswer 적용
+    // pending ANSWER 적용
     if (pendingAnswers.current[peerName]) {
       pc.setRemoteDescription(
-        new RTCSessionDescription(pendingAnswers.current[peerName]) // Session Description 적용
+        new RTCSessionDescription(pendingAnswers.current[peerName])
       )
         .then(() => {
           console.log("Pending ANSWER 적용 완료:", peerName);
-          delete pendingAnswers.current[peerName]; // 임시 ANSWER 제거
+          delete pendingAnswers.current[peerName];
         })
         .catch(console.error);
     }
 
-    return pc; // RTCPeerConnection 반환
+    return pc;
   };
 
   // OFFER 전송 (Broadcaster)
   const sendOffer = async (peerName) => {
     const pc = createPeerConnection(peerName);
-    const offer = await pc.createOffer(); // Session Description(OFFER) 생성
-    await pc.setLocalDescription(offer);  // LocalDescription 설정
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
     mqttClient.current.publish(
       `${roomId}/offer`,
       JSON.stringify({
         sender: localStorage.getItem("username"),
         target: peerName,
-        sdp: offer, // Session Description(OFFER) 전송
+        sdp: offer,
       })
     );
   };
 
-  return { role, peers, localStream, localReady }; // 훅 반환값
+  return { role, peers, localStream, localReady };
 };

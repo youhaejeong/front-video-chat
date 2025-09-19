@@ -1,5 +1,6 @@
 import React, { useRef } from "react";
 import { useWebRTC } from "../hooks/useWebRTC";
+import axios from "axios";
 
 const VideoChatRoom = () => {
   const roomId = localStorage.getItem("roomId");
@@ -11,7 +12,7 @@ const VideoChatRoom = () => {
   const { role, peers, localReady } = useWebRTC(
     roomId,
     localVideoRef,
-    peerVideoRefs
+    peerVideoRefs 
   );
 
   if (!role) return <p>역할 확인 중...</p>;
@@ -19,6 +20,7 @@ const VideoChatRoom = () => {
   return (
     <div style={{ display: "flex", flexWrap: "wrap" }}>
       <div style={{ width: "100%", marginBottom: "10px" }}>역할: {role}</div>
+      <div>접속자 닉네임 :  {username}</div>
 
       {role === "ROLE_BROADCASTER" && localReady && (
         <video

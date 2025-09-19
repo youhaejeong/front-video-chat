@@ -15,17 +15,23 @@ const Login = ({ onLogin }) => {
         password: "123", // 고정
       });
 
-      localStorage.setItem("username", username);
-      localStorage.setItem("roomId", roomId);
-      localStorage.setItem("accessToken", res.data.accessToken);
-      localStorage.setItem("refreshToken", res.data.refreshToken);
-      console.log(res.data.role)
-      localStorage.setItem("role", res.data.role);
+      const userData = {
+        username,
+        roomId,
+        accessToken: res.data.accessToken,
+        refreshToken: res.data.refreshToken,
+        role: res.data.role,
+      };
 
-      onLogin(); // 부모 컴포넌트 상태 변경
+      // localStorage 저장
+      Object.entries(userData).forEach(([key, value]) => {
+        localStorage.setItem(key, value);
+      });
+
+      onLogin(userData); // 부모로 로그인 성공 데이터 전달
     } catch (err) {
       console.error("로그인 실패:", err);
-      
+      alert("로그인 실패. 서버를 확인하세요.");
     }
   };
 
