@@ -325,5 +325,44 @@ export const useWebRTC = (roomId, localVideoRef, peerVideoRefs) => {
     );
   };
 
-  return { role, peers, localStream, localReady };
+  const cleanup = () => {
+    console.log("cleanup 실행");
+
+    // PeerConnection 닫기
+    Object.values(peerConnections.current).forEach((pcObj) => pcObj.pc.close());
+    peerConnections.current = {};
+
+    // 로컬 스트림 정리
+    if (localStream.current) {
+      localStream.current.getTracks().forEach((track) => track.stop());
+      localStream.current = null;
+    }
+
+    // 로컬 비디오 요소 srcObject 해제
+    if (localVideoRef?.current) {
+      // ?. 추가
+      localVideoRef.current.srcObject = null;
+    }
+
+    // 피어 비디오 요소 srcObject 해제
+    if (peerVideoRefs?.current) {
+      Object.values(peerVideoRefs.current).forEach((video) => {
+        if (video) video.srcObject = null;
+      });
+    }
+
+    // pending 객체 초기화
+    pendingCandidates.current = {};
+    pendingAnswers.current = {};
+    pendingStreams.current = {};
+  };
+
+  // 컴포넌트 언마운트 시 자동 cleanup 실행
+  useEffect(() => {
+    return () => {
+      cleanup();
+    };
+  }, []);
+
+  return { role, peers, localStream, localReady, cleanup, mqttClient };
 };
